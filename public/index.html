@@ -248,7 +248,7 @@ function drawEvent() {
           <div><label>Item</label><input name="item" placeholder="Dinner, hotel…" required></div>
           <div><label>Amount</label><input name="amount" type="number" step="0.01" min="0.01" required></div>
           <div><label>Currency</label><input name="currency" value="${esc(ev.currency)}" maxlength="3" required></div>
-          <div id="rateBox" hidden><label id="rateLabel">Rate</label><input name="rate" type="number" step="any" min="0"></div>
+          <div id="rateBox" hidden><label id="rateLabel">Rate</label><input name="rate" type="number" step="any" min="0" max="1000000"><div class="muted" id="ratePreview"></div></div>
           <div><label>Paid by</label><select name="paidBy">${members.map(m => `<option value="${m.id}" ${m.id === me.id ? 'selected' : ''}>${esc(m.username)}</option>`).join('')}</select></div>
         </div>
         <label>Split equally between</label>
@@ -306,14 +306,21 @@ function drawEvent() {
 
   // Expenses
   const xf = $('#xf');
+  let rateCur = null; // the currency the rate field was last filled for
   const syncRate = () => {
     const cur = xf.currency.value.trim().toUpperCase();
     const foreign = cur.length === 3 && cur !== ev.currency;
     $('#rateBox').hidden = !foreign;
     xf.rate.required = foreign;
-    if (foreign) { $('#rateLabel').textContent = `1 ${cur} = ? ${ev.currency}`; if (!xf.rate.value) xf.rate.value = lastRate(cur); }
+    if (foreign) {
+      $('#rateLabel').textContent = `1 ${cur} = ? ${ev.currency}`;
+      // A rate typed for one currency is wrong for another, so refill it whenever the currency changes.
+      if (cur !== rateCur) { xf.rate.value = lastRate(cur); rateCur = cur; }
+    }
+    const converted = Number(xf.amount.value) * Number(xf.rate.value);
+    $('#ratePreview').textContent = foreign && converted > 0 && Number.isFinite(converted) ? `≈ ${money(converted, ev.currency)}` : '';
   };
-  xf.currency.oninput = syncRate;
+  xf.currency.oninput = xf.amount.oninput = xf.rate.oninput = syncRate;
   xf.onsubmit = async e => {
     e.preventDefault();
     const f = new FormData(xf);

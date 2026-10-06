@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { DatabaseSync } = require('node:sqlite');
+const { settle, isValidAmount, isValidRate, toCents, MAX_AMOUNT, MAX_RATE } = require('./lib/settle');
 
 const PORT = process.env.PORT || 3000;
 const db = new DatabaseSync(process.env.DB_FILE || path.join(__dirname, 'kaki.db'));
@@ -85,39 +86,6 @@ function suggest(ev, memberIds, unavail) {
   }
   options.sort((a, b) => a.clashes.length - b.clashes.length || a.start.localeCompare(b.start));
   return options.slice(0, 3);
-}
-
-// ---------- money ----------
-const cents = x => Math.round(x * 100) / 100;
-// Net balance per user in the event's currency (+ = is owed money), and the fewest transfers to settle.
-function settle(expenses, shareRows, memberIds) {
-  const bal = new Map(memberIds.map(id => [id, 0]));
-  const sharesBy = new Map();
-  for (const s of shareRows) (sharesBy.get(s.expense_id) || sharesBy.set(s.expense_id, []).get(s.expense_id)).push(s.user_id);
-  for (const e of expenses) {
-    const total = e.amount * e.rate;
-    const who = sharesBy.get(e.id) || [];
-    if (!who.length) continue;
-    bal.set(e.paid_by, (bal.get(e.paid_by) || 0) + total);
-    for (const id of who) bal.set(id, (bal.get(id) || 0) - total / who.length);
-  }
-  const debtors = [], creditors = [];
-  for (const [id, b] of bal) {
-    if (b < -0.005) debtors.push({ id, amt: -b });
-    else if (b > 0.005) creditors.push({ id, amt: b });
-  }
-  debtors.sort((a, b) => b.amt - a.amt);
-  creditors.sort((a, b) => b.amt - a.amt);
-  const transfers = [];
-  let i = 0, j = 0;
-  while (i < debtors.length && j < creditors.length) {
-    const amt = Math.min(debtors[i].amt, creditors[j].amt);
-    if (amt >= 0.005) transfers.push({ from: debtors[i].id, to: creditors[j].id, amount: cents(amt) });
-    debtors[i].amt -= amt; creditors[j].amt -= amt;
-    if (debtors[i].amt < 0.005) i++;
-    if (creditors[j].amt < 0.005) j++;
-  }
-  return { balances: Object.fromEntries([...bal].map(([id, b]) => [id, cents(b)])), transfers };
 }
 
 // ---------- http helpers ----------
@@ -257,10 +225,13 @@ async function api(req, res, url, user) {
     const b = await readBody(req);
     const item = str(b.item) || fail(400, 'Item required');
     const amount = Number(b.amount);
-    if (!(amount > 0) || amount > 1e9) fail(400, 'Amount must be positive');
+    if (!isValidAmount(amount)) fail(400, `Amount must be more than 0 and at most ${MAX_AMOUNT.toLocaleString('en')}`);
     const cur = currency(b.currency || ev.currency);
     const rate = cur === ev.currency ? 1 : Number(b.rate);
-    if (!(rate > 0)) fail(400, `Enter the rate: 1 ${cur} = ? ${ev.currency}`);
+    if (!isValidRate(rate)) fail(400, `Enter the rate (up to ${MAX_RATE.toLocaleString('en')}): 1 ${cur} = ? ${ev.currency}`);
+    const converted = toCents(amount * rate);
+    if (converted < 1) fail(400, `That is less than 0.01 ${ev.currency} after conversion`);
+    if (converted > MAX_AMOUNT * 100) fail(400, `That is more than ${MAX_AMOUNT.toLocaleString('en')} ${ev.currency} after conversion`);
     const paidBy = Number(b.paidBy);
     if (!memberIds.includes(paidBy)) fail(400, 'Payer must be in the event');
     const split = [...new Set((Array.isArray(b.splitWith) ? b.splitWith : []).map(Number))].filter(x => memberIds.includes(x));
