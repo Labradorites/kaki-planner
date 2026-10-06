@@ -20,6 +20,7 @@
   button { font:inherit; border:0; border-radius:6px; padding:8px 14px; background:var(--accent); color:#fff; cursor:pointer; }
   button.ghost { background:transparent; color:var(--accent); border:1px solid var(--line); }
   button.danger { background:transparent; color:var(--bad); border:1px solid var(--line); padding:4px 8px; font-size:13px; }
+  button:disabled { opacity:.55; cursor:progress; }
   .row { display:grid; grid-template-columns:repeat(auto-fit, minmax(140px, 1fr)); gap:10px; }
   .muted { color:var(--muted); font-size:13px; }
   .err { color:var(--bad); min-height:1.2em; font-size:14px; }
@@ -29,7 +30,10 @@
   .list a:last-child { border:0; }
   .pill { display:inline-block; padding:2px 8px; border-radius:99px; font-size:12px; background:var(--bg); border:1px solid var(--line); }
   .best { background:var(--goodbg); border-color:transparent; color:var(--good); padding:12px; border-radius:8px; font-weight:600; }
+  .best.tentative { background:var(--bg); border:1px solid var(--line); color:var(--ink); }
   .cal { display:grid; grid-template-columns:repeat(7, 1fr); gap:4px; }
+  .cal.busy { opacity:.7; cursor:progress; }
+  .cal.busy .day { cursor:progress; }
   .cal .dow { font-size:12px; color:var(--muted); text-align:center; }
   .day { border:1px solid var(--line); border-radius:6px; padding:4px; min-height:48px; cursor:pointer; font-size:13px; user-select:none; background:var(--card); }
   .day.past { opacity:.4; }
@@ -51,31 +55,53 @@
 let me = null, users = [];
 const $ = s => document.querySelector(s);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
-const money = (n, cur) => `${cur} ${Number(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+// Uses the currency's own decimals (JPY 1,500, SGD 12.50). Codes keep SGD and USD apart where symbols wouldn't.
+const money = (n, cur) => {
+  try { return new Intl.NumberFormat(undefined, { style: 'currency', currency: cur, currencyDisplay: 'code' }).format(n); }
+  catch { return `${esc(cur)} ${Number(n).toFixed(2)}`; }
+};
 const fmtDate = d => new Date(d + 'T00:00:00').toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
 const addDays = (d, n) => { const x = new Date(d + 'T00:00:00Z'); x.setUTCDate(x.getUTCDate() + n); return x.toISOString().slice(0, 10); };
 const today = () => new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
 const nameOf = id => (users.find(u => u.id === id) || {}).username || '?';
 
 async function api(path, opts = {}) {
-  const res = await fetch(path, { ...opts, headers: { 'content-type': 'application/json' }, body: opts.body && JSON.stringify(opts.body) });
+  let res;
+  try { res = await fetch(path, { ...opts, headers: { 'content-type': 'application/json' }, body: opts.body && JSON.stringify(opts.body) }); }
+  catch { throw new Error("Couldn't reach the server. Check your connection and try again."); }
   const data = await res.json().catch(() => ({}));
   if (res.status === 401 && me) { me = null; route(); }
-  if (!res.ok) throw new Error(data.error || 'Something went wrong');
+  if (!res.ok) throw Object.assign(new Error(data.error || 'Something went wrong'), { status: res.status });
   return data;
 }
+// Disables the button (or every button in a form) while fn runs, so a second tap can't send the request twice.
+async function busy(el, fn) {
+  const btns = el.tagName === 'FORM' ? [...el.querySelectorAll('button')] : [el];
+  btns.forEach(b => b.disabled = true);
+  try { return await fn(); } finally { btns.forEach(b => b.disabled = false); }
+}
+const loadError = (msg, back) => `<div class="card"><p class="err">${esc(msg)}</p>
+  <button onclick="this.disabled = true; route()">Retry</button>${back ? ` <button class="ghost" onclick="go('')">Back</button>` : ''}</div>`;
 const go = hash => { location.hash = hash; };
 window.addEventListener('hashchange', route);
-$('#logout').onclick = async () => { await api('/api/logout', { method: 'POST' }); me = null; go(''); route(); };
+$('#logout').onclick = () => busy($('#logout'), async () => {
+  try { await api('/api/logout', { method: 'POST' }); me = null; go(''); route(); }
+  catch (e) { alert(e.message); }
+});
 
 async function route() {
-  if (!me) { try { me = await api('/api/me'); } catch { me = null; } }
+  if (!me) {
+    try { me = await api('/api/me'); }
+    catch (e) { if (e.status !== 401) { $('#app').innerHTML = loadError(e.message); return; } me = null; }
+  }
   $('#who').textContent = me ? `Hi, ${me.username}` : '';
   $('#logout').hidden = !me;
   if (!me) return renderAuth();
-  users = await api('/api/users');
-  const m = location.hash.match(/^#event\/(\d+)$/);
-  m ? renderEvent(Number(m[1])) : renderHome();
+  try {
+    users = await api('/api/users');
+    const m = location.hash.match(/^#event\/(\d+)$/);
+    await (m ? renderEvent(Number(m[1])) : renderHome());
+  } catch (e) { $('#app').innerHTML = loadError(e.message); }
 }
 
 // ---------- login / sign up ----------
@@ -94,8 +120,11 @@ function renderAuth() {
     ev.preventDefault();
     const f = new FormData(ev.target);
     const action = ev.submitter?.name === 'register' ? 'register' : 'login';
-    try { me = await api('/api/' + action, { method: 'POST', body: { username: f.get('username'), password: f.get('password') } }); route(); }
-    catch (e) { $('#e').textContent = e.message; }
+    $('#e').textContent = '';
+    await busy(ev.target, async () => {
+      try { me = await api('/api/' + action, { method: 'POST', body: { username: f.get('username'), password: f.get('password') } }); route(); }
+      catch (e) { $('#e').textContent = e.message; }
+    });
   };
 }
 
@@ -132,29 +161,40 @@ async function renderHome() {
   $('#f').onsubmit = async ev => {
     ev.preventDefault();
     const f = new FormData(ev.target);
-    try {
-      const { id } = await api('/api/events', { method: 'POST', body: {
-        title: f.get('title'), start: f.get('start'), end: f.get('end'), length: Number(f.get('length')),
-        currency: f.get('currency'), members: f.getAll('m').map(Number) } });
-      go('event/' + id);
-    } catch (e) { $('#e').textContent = e.message; }
+    $('#e').textContent = '';
+    await busy(ev.target, async () => {
+      try {
+        const { id } = await api('/api/events', { method: 'POST', body: {
+          title: f.get('title'), start: f.get('start'), end: f.get('end'), length: Number(f.get('length')),
+          currency: f.get('currency'), members: f.getAll('m').map(Number) } });
+        go('event/' + id);
+      } catch (e) { $('#e').textContent = e.message; }
+    });
   };
 }
 
 // ---------- event detail ----------
-let detail = null;
+let detail = null, focusDay = null, calSaving = false;
 async function renderEvent(id) {
-  try { detail = await api('/api/events/' + id); } catch (e) { $('#app').innerHTML = `<div class="card"><p class="err">${esc(e.message)}</p><button onclick="go('')">Back</button></div>`; return; }
+  try { detail = await api('/api/events/' + id); } catch (e) { $('#app').innerHTML = loadError(e.message, true); return; }
+  focusDay = null;
   drawEvent();
 }
 
 function drawEvent() {
-  const { event: ev, members, unavailable, suggestions, expenses, balances, transfers } = detail;
+  const { event: ev, members, unavailable, responded, suggestions, expenses, balances, transfers } = detail;
   const best = suggestions[0];
   const mineSet = new Set(unavailable.filter(u => u.user_id === me.id).map(u => u.day));
   const othersBy = {};
   for (const u of unavailable) if (u.user_id !== me.id) (othersBy[u.day] ||= []).push(u.user_id);
   const inBest = d => best && d >= best.start && d <= best.end;
+  // Until everyone has responded, a day with no clashes may just mean people haven't looked yet.
+  const respondedSet = new Set(responded);
+  const waiting = members.filter(m => !respondedSet.has(m.id)).map(m => m.id === me.id ? 'you' : m.username);
+  const dayInfo = (d, mine) => {
+    const out = [...(mine.has(d) ? ['you'] : []), ...(othersBy[d] || []).map(nameOf)];
+    return `<b>${fmtDate(d)}</b>: ${out.length ? "can't make it: " + esc(out.join(', ')) : 'no one has marked this day'}`;
+  };
 
   // Calendar: pad to Monday start
   const first = new Date(ev.start_date + 'T00:00:00Z');
@@ -170,13 +210,16 @@ function drawEvent() {
       <div class="n">${label}</div>${others.length ? `<div class="x">✕ ${others.length}</div>` : ''}</div>`;
   }
 
+  const clashCount = n => n ? `${n} ${n === 1 ? 'clash' : 'clashes'}` : waiting.length ? 'no clashes yet' : 'all free';
   const suggestText = !best ? '<p class="muted">No dates left in this window.</p>' : `
-    <div class="best">${best.clashes.length ? 'Best option' : 'Everyone can make it'}: ${fmtDate(best.start)}${ev.length > 1 ? ' – ' + fmtDate(best.end) : ''}
+    <div class="best ${waiting.length ? 'tentative' : ''}">${waiting.length ? 'Best so far' : best.clashes.length ? 'Best option' : 'Everyone can make it'}: ${fmtDate(best.start)}${ev.length > 1 ? ' – ' + fmtDate(best.end) : ''}
       ${best.clashes.length ? `<div class="muted">Can't make it: ${esc(best.clashes.map(nameOf).join(', '))}</div>` : ''}</div>
-    ${suggestions.length > 1 ? `<p class="muted">Other options: ${suggestions.slice(1).map(s => `${fmtDate(s.start)}${ev.length > 1 ? ' – ' + fmtDate(s.end) : ''} (${s.clashes.length ? s.clashes.length + ' clash' : 'all free'})`).join(' · ')}</p>` : ''}`;
+    ${waiting.length ? `<p class="muted">Waiting on: ${esc(waiting.join(', '))}</p>` : ''}
+    ${suggestions.length > 1 ? `<p class="muted">Other options: ${suggestions.slice(1).map(s => `${fmtDate(s.start)}${ev.length > 1 ? ' – ' + fmtDate(s.end) : ''} (${clashCount(s.clashes.length)})`).join(' · ')}</p>` : ''}`;
 
   const lastRate = cur => (expenses.find(e => e.currency === cur) || {}).rate || '';
   const myBal = balances[me.id] || 0;
+  const square = Math.abs(myBal) < 0.005;
 
   $('#app').innerHTML = `
     <p><a href="#" onclick="go('');return false">← All events</a></p>
@@ -185,15 +228,17 @@ function drawEvent() {
       <div class="muted">Window ${fmtDate(ev.start_date)} – ${fmtDate(ev.end_date)} · ${members.map(m => esc(m.username)).join(', ')}</div>
       <h3>Suggested date</h3>${suggestText}
       <h3>Days you can't make it</h3>
-      <p class="muted">Tap days to mark them red. ✕ shows how many others can't make it (hover for names). Green outline is the suggestion.</p>
+      <p class="muted">Tap days to mark them red. ✕ shows how many others can't make it; the day you tap shows their names below. Green outline is the suggestion.</p>
       <div class="cal" id="cal">${cells}</div>
+      <p class="muted" id="dayInfo">${focusDay ? dayInfo(focusDay, mineSet) : ''}</p>
+      ${respondedSet.has(me.id) ? '' : `<p><button class="ghost" id="allFree">I'm free on all days</button></p>`}
       <p class="err" id="calErr"></p>
       ${ev.created_by === me.id ? '<button class="danger" id="delEv">Delete event</button>' : ''}
     </div>
 
     <div class="card">
       <h2>Spending</h2>
-      <p>Your balance: <b class="${myBal >= 0 ? 'pos' : 'neg'}">${myBal >= 0 ? 'you are owed ' : 'you owe '}${money(Math.abs(myBal), ev.currency)}</b></p>
+      <p>Your balance: ${square ? '<b>All square</b>' : `<b class="${myBal > 0 ? 'pos' : 'neg'}">${myBal > 0 ? 'you are owed ' : 'you owe '}${money(Math.abs(myBal), ev.currency)}</b>`}</p>
       <h3>Settle up</h3>
       ${transfers.length ? `<table>${transfers.map(t => `<tr class="${t.from === me.id || t.to === me.id ? 'me' : ''}"><td>${esc(nameOf(t.from))} pays ${esc(nameOf(t.to))}</td><td>${money(t.amount, ev.currency)}</td></tr>`).join('')}</table>` : '<p class="muted">All square.</p>'}
 
@@ -213,28 +258,50 @@ function drawEvent() {
       </form>
 
       <h3>All expenses</h3>
+      <p class="err" id="de"></p>
       ${expenses.length ? `<table><tr><th>Item</th><th>Amount</th><th>Paid by</th><th>Split</th><th></th></tr>${expenses.map(e => `
         <tr><td>${esc(e.item)}<div class="muted">${new Date(e.created_at).toLocaleDateString()}</div></td>
-          <td>${money(e.amount, esc(e.currency))}${e.currency !== ev.currency ? `<div class="muted">≈ ${money(e.amount * e.rate, ev.currency)}</div>` : ''}</td>
+          <td>${money(e.amount, e.currency)}${e.currency !== ev.currency ? `<div class="muted">≈ ${money(e.amount * e.rate, ev.currency)}</div>` : ''}</td>
           <td>${esc(nameOf(e.paid_by))}</td>
           <td>${e.shares.length === members.length ? 'Everyone' : esc(e.shares.map(nameOf).join(', '))}</td>
           <td>${e.created_by === me.id || ev.created_by === me.id ? `<button class="danger" data-del="${e.id}">Delete</button>` : ''}</td></tr>`).join('')}</table>`
         : '<p class="muted">Nothing spent yet.</p>'}
     </div>`;
 
-  // Availability: toggle and save immediately
+  // Availability: toggle and save immediately. One save at a time, so saves can't land out of order.
   $('#cal').onclick = async e => {
     const cell = e.target.closest('.day');
-    if (!cell) return;
+    if (!cell || calSaving) return;
     const d = cell.dataset.day;
-    mineSet.has(d) ? mineSet.delete(d) : mineSet.add(d);
+    const days = new Set(mineSet);
+    days.has(d) ? days.delete(d) : days.add(d);
+    focusDay = d;
     cell.classList.toggle('mine');
-    try { detail = await api(`/api/events/${ev.id}/unavailable`, { method: 'PUT', body: { days: [...mineSet] } }); drawEvent(); }
-    catch (err) { $('#calErr').textContent = err.message; }
+    $('#dayInfo').innerHTML = dayInfo(d, days);
+    $('#calErr').textContent = '';
+    calSaving = true;
+    $('#cal').classList.add('busy');
+    try { detail = await api(`/api/events/${ev.id}/unavailable`, { method: 'PUT', body: { days: [...days] } }); }
+    catch (err) {
+      cell.classList.toggle('mine');
+      $('#dayInfo').innerHTML = dayInfo(d, mineSet);
+      $('#calErr').textContent = "Couldn't save: " + err.message;
+      return;
+    } finally { calSaving = false; $('#cal').classList.remove('busy'); }
+    drawEvent();
   };
+  if ($('#allFree')) $('#allFree').onclick = () => busy($('#allFree'), async () => {
+    $('#calErr').textContent = '';
+    try { detail = await api(`/api/events/${ev.id}/unavailable`, { method: 'PUT', body: { days: [] } }); drawEvent(); }
+    catch (err) { $('#calErr').textContent = "Couldn't save: " + err.message; }
+  });
   if ($('#delEv')) $('#delEv').onclick = async () => {
     if (!confirm('Delete this event and all its expenses?')) return;
-    await api('/api/events/' + ev.id, { method: 'DELETE' }); go('');
+    $('#calErr').textContent = '';
+    await busy($('#delEv'), async () => {
+      try { await api('/api/events/' + ev.id, { method: 'DELETE' }); go(''); }
+      catch (err) { $('#calErr').textContent = "Couldn't delete: " + err.message; }
+    });
   };
 
   // Expenses
@@ -250,16 +317,23 @@ function drawEvent() {
   xf.onsubmit = async e => {
     e.preventDefault();
     const f = new FormData(xf);
-    try {
-      detail = await api(`/api/events/${ev.id}/expenses`, { method: 'POST', body: {
-        item: f.get('item'), amount: Number(f.get('amount')), currency: f.get('currency'), rate: Number(f.get('rate')),
-        paidBy: Number(f.get('paidBy')), splitWith: f.getAll('s').map(Number) } });
-      drawEvent();
-    } catch (err) { $('#xe').textContent = err.message; }
+    $('#xe').textContent = '';
+    await busy(xf, async () => {
+      try {
+        detail = await api(`/api/events/${ev.id}/expenses`, { method: 'POST', body: {
+          item: f.get('item'), amount: Number(f.get('amount')), currency: f.get('currency'), rate: Number(f.get('rate')),
+          paidBy: Number(f.get('paidBy')), splitWith: f.getAll('s').map(Number) } });
+        drawEvent();
+      } catch (err) { $('#xe').textContent = err.message; }
+    });
   };
   document.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
     if (!confirm('Delete this expense?')) return;
-    detail = await api('/api/expenses/' + b.dataset.del, { method: 'DELETE' }); drawEvent();
+    $('#de').textContent = '';
+    await busy(b, async () => {
+      try { detail = await api('/api/expenses/' + b.dataset.del, { method: 'DELETE' }); drawEvent(); }
+      catch (err) { $('#de').textContent = "Couldn't delete: " + err.message; }
+    });
   });
 }
 
