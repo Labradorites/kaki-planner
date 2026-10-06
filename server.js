@@ -24,6 +24,11 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS unavailable (
     event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
     user_id INTEGER NOT NULL REFERENCES users(id), day TEXT NOT NULL, PRIMARY KEY (event_id, user_id, day));
+  -- Members who have answered the scheduler (marked days or said they're free on all days).
+  CREATE TABLE IF NOT EXISTS responded (
+    event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id), PRIMARY KEY (event_id, user_id));
+  INSERT OR IGNORE INTO responded (event_id, user_id) SELECT DISTINCT event_id, user_id FROM unavailable;
   CREATE TABLE IF NOT EXISTS expenses (
     id INTEGER PRIMARY KEY, event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
     item TEXT NOT NULL, amount REAL NOT NULL, currency TEXT NOT NULL, rate REAL NOT NULL,
@@ -153,6 +158,7 @@ function eventDetail(id, user) {
     event: ev,
     members: q(`SELECT u.id, u.username FROM members m JOIN users u ON u.id = m.user_id WHERE m.event_id = ? ORDER BY u.username`).all(id),
     unavailable: unavail,
+    responded: q('SELECT user_id FROM responded WHERE event_id = ?').all(id).map(r => r.user_id),
     suggestions: suggest(ev, memberIds, unavail),
     expenses: expenses.map(e => ({ ...e, shares: shares[e.id] || [] })),
     ...settle(expenses, shareRows, memberIds),
@@ -238,6 +244,7 @@ async function api(req, res, url, user) {
     try {
       q('DELETE FROM unavailable WHERE event_id = ? AND user_id = ?').run(id, user.id);
       for (const d of days) q('INSERT INTO unavailable (event_id, user_id, day) VALUES (?, ?, ?)').run(id, user.id, d);
+      q('INSERT OR IGNORE INTO responded (event_id, user_id) VALUES (?, ?)').run(id, user.id);
       db.exec('COMMIT');
     } catch (e) { db.exec('ROLLBACK'); throw e; }
     return send(res, 200, eventDetail(id, user));
